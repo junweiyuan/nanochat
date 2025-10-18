@@ -14,7 +14,7 @@ import time
 import wandb
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, create_multi_token_targets
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -30,6 +30,7 @@ run = "dummy" # wandb run name default ("dummy" is special - we won't log to wan
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
+n_predict = 1 # number of tokens to predict ahead (1 = standard, >1 = multi-token prediction)
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -92,7 +93,7 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, n_predict=n_predict)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
@@ -256,11 +257,15 @@ for step in range(num_iterations + 1):
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            if n_predict > 1:
+                y_multi = create_multi_token_targets(y, n_predict)
+                loss = model(x, y_multi)
+            else:
+                loss = model(x, y)
+        train_loss = loss.detach()
+        loss = loss / grad_accum_steps
         loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y = next(train_loader)
     # gradient clipping (TODO possibly expertiment with)
     if grad_clip > 0.0:
         torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)

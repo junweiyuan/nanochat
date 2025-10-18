@@ -23,6 +23,25 @@ from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 
+def create_multi_token_targets(targets, n_predict):
+    """
+    Create multi-token targets for multi-token prediction training.
+    
+    Args:
+        targets: Tensor of shape (B, T) containing target tokens
+        n_predict: Number of tokens to predict ahead
+    
+    Returns:
+        Tensor of shape (B, T, n_predict) where targets[:, :, i] contains tokens i steps ahead
+    """
+    B, T = targets.size()
+    multi_targets = torch.zeros(B, T, n_predict, dtype=targets.dtype, device=targets.device)
+    multi_targets.fill_(-1)
+    for i in range(n_predict):
+        if i < T:
+            multi_targets[:, :T-i, i] = targets[:, i:]
+    return multi_targets
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 1024
@@ -31,6 +50,7 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    n_predict: int = 1 # number of tokens to predict ahead (1 = standard, >1 = multi-token prediction)
 
 
 def norm(x):
@@ -160,6 +180,11 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        if config.n_predict > 1:
+            self.mtp_heads = nn.ModuleList([
+                nn.Linear(config.n_embd, config.vocab_size, bias=False)
+                for _ in range(config.n_predict - 1)
+            ])
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -176,6 +201,9 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         # zero out classifier weights
         torch.nn.init.zeros_(self.lm_head.weight)
+        if self.config.n_predict > 1:
+            for head in self.mtp_heads:
+                torch.nn.init.zeros_(head.weight)
         # zero out c_proj weights in all blocks
         for block in self.transformer.h:
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -228,12 +256,18 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        # Separate out all parameters into groups (matrix, embedding, lm_head, mtp_heads)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
-        # Create the AdamW optimizer for the embedding and lm_head
+        expected_params = len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        if self.config.n_predict > 1:
+            mtp_params = []
+            for head in self.mtp_heads:
+                mtp_params.extend(list(head.parameters()))
+            expected_params += len(mtp_params)
+        assert len(list(self.parameters())) == expected_params
+        # Create the AdamW optimizer for the embedding and lm_head (and mtp_heads if present)
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         if rank == 0:
@@ -242,6 +276,8 @@ class GPT(nn.Module):
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
+        if self.config.n_predict > 1:
+            adam_groups.append(dict(params=mtp_params, lr=unembedding_lr * dmodel_lr_scale))
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
@@ -278,16 +314,30 @@ class GPT(nn.Module):
         softcap = 15
         if targets is not None:
             # training mode: compute and return the loss
-            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            if self.config.n_predict > 1 and targets.dim() == 3:
+                total_loss = 0.0
+                logits_0 = self.lm_head(x)
+                logits_0 = softcap * torch.tanh(logits_0 / softcap)
+                logits_0 = logits_0.float()
+                loss_0 = F.cross_entropy(logits_0.view(-1, logits_0.size(-1)), targets[:, :, 0].reshape(-1), ignore_index=-1, reduction=loss_reduction)
+                total_loss = loss_0
+                for i, mtp_head in enumerate(self.mtp_heads):
+                    logits_i = mtp_head(x)
+                    logits_i = softcap * torch.tanh(logits_i / softcap)
+                    logits_i = logits_i.float()
+                    loss_i = F.cross_entropy(logits_i.view(-1, logits_i.size(-1)), targets[:, :, i+1].reshape(-1), ignore_index=-1, reduction=loss_reduction)
+                    total_loss = total_loss + loss_i
+                return total_loss / self.config.n_predict
+            else:
+                logits = self.lm_head(x)
+                logits = softcap * torch.tanh(logits / softcap)
+                logits = logits.float()
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+                return loss
         else:
-            # inference mode: compute and return the logits
+            # inference mode: compute and return the logits (only primary head for now)
             logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            logits = softcap * torch.tanh(logits / softcap)
             return logits
 
     @torch.inference_mode()

@@ -21,6 +21,7 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.checkpoint_manager import load_model
+from nanochat.gpt import create_multi_token_targets
 import torch.distributed as dist
 
 from tasks.common import TaskMixture
@@ -204,6 +205,7 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "n_predict": model.config.n_predict,
                 },
                 "user_config": user_config, # inputs to the training script
             }
@@ -219,12 +221,16 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            if model.config.n_predict > 1:
+                y_multi = create_multi_token_targets(y, model.config.n_predict)
+                loss = model(x, y_multi)
+            else:
+                loss = model(x, y)
+        train_loss = loss.detach()
+        loss = loss / grad_accum_steps
         loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        progress = max(progress, approx_progress) # only increase progress monotonically
+        x, y = next(train_loader)
+        progress = max(progress, approx_progress)
     # step the optimizers
     lrm = get_lr_multiplier(progress)
     for opt in optimizers:

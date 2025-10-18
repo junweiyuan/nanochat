@@ -20,6 +20,7 @@ from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0,
 from nanochat.checkpoint_manager import load_model
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.engine import Engine
+from nanochat.gpt import create_multi_token_targets
 from scripts.chat_eval import run_chat_eval
 
 from tasks.common import TaskMixture
@@ -207,10 +208,14 @@ for step in range(num_iterations):
     for micro_step in range(grad_accum_steps):
         train_inputs, train_targets = next(train_iter)
         with autocast_ctx:
-            loss = model(train_inputs, train_targets)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward() # accumulate the gradient
+            if model.config.n_predict > 1:
+                train_targets_multi = create_multi_token_targets(train_targets, model.config.n_predict)
+                loss = model(train_inputs, train_targets_multi)
+            else:
+                loss = model(train_inputs, train_targets)
+        train_loss = loss.detach()
+        loss = loss / grad_accum_steps
+        loss.backward()
         num_tokens += (train_targets >= 0).sum()
     if ddp:
         dist.all_reduce(num_tokens, op=dist.ReduceOp.SUM) # sum over ranks

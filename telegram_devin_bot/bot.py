@@ -23,6 +23,8 @@ chat_sessions: dict[int, str] = {}
 
 last_seen_status: dict[str, str] = {}
 
+last_seen_event: dict[str, str] = {}
+
 
 def is_allowed(update: Update) -> bool:
     if not ALLOWED_USERS:
@@ -67,6 +69,10 @@ async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         url = result.get("url", f"https://app.devin.ai/sessions/{session_id}")
         chat_sessions[update.effective_chat.id] = session_id
         last_seen_status[session_id] = "running"
+        details = await devin.get_session(session_id)
+        msgs = details.get("messages", [])
+        if msgs:
+            last_seen_event[session_id] = msgs[-1].get("event_id", "")
         await update.message.reply_text(
             f"Session created!\n"
             f"ID: `{session_id}`\n"
@@ -166,6 +172,10 @@ async def select_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         details = await devin.get_session(session_id)
         chat_sessions[update.effective_chat.id] = session_id
         status_enum = details.get("status_enum", "unknown")
+        last_seen_status[session_id] = status_enum
+        msgs = details.get("messages", [])
+        if msgs:
+            last_seen_event[session_id] = msgs[-1].get("event_id", "")
         await update.message.reply_text(
             f"Switched to session `{session_id}`\nStatus: {status_enum}",
             parse_mode="Markdown",
@@ -209,6 +219,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Failed to send message: {e}")
 
 
+def get_new_devin_messages(details: dict, session_id: str) -> list[str]:
+    messages = details.get("messages", [])
+    last_event = last_seen_event.get(session_id)
+    new_msgs: list[str] = []
+    found_last = last_event is None
+    for msg in messages:
+        event_id = msg.get("event_id", "")
+        if not found_last:
+            if event_id == last_event:
+                found_last = True
+            continue
+        if msg.get("type") == "devin_message":
+            text = msg.get("message", "")
+            if text:
+                new_msgs.append(text)
+    if messages:
+        last_seen_event[session_id] = messages[-1].get("event_id", "")
+    return new_msgs
+
+
 async def poll_sessions(app: Application) -> None:
     while True:
         await asyncio.sleep(POLL_INTERVAL)
@@ -216,21 +246,29 @@ async def poll_sessions(app: Application) -> None:
             try:
                 details = await devin.get_session(session_id)
                 current_status = details.get("status_enum", "unknown")
+
+                new_msgs = get_new_devin_messages(details, session_id)
+                for msg_text in new_msgs:
+                    truncated = msg_text[:4000]
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Devin: {truncated}",
+                    )
+
                 prev_status = last_seen_status.get(session_id)
                 if prev_status and prev_status != current_status:
-                    status_msg = f"Session `{session_id[:8]}...` status: {prev_status} -> {current_status}"
+                    status_msg = f"[{current_status}]"
                     if current_status == "finished":
                         pr = details.get("pull_request", {})
                         pr_url = pr.get("url", "") if pr else ""
-                        status_msg += "\nDevin has finished working."
+                        status_msg += " Devin has finished."
                         if pr_url:
                             status_msg += f"\nPR: {pr_url}"
                     elif current_status == "blocked":
-                        status_msg += "\nDevin is blocked and waiting for your input."
+                        status_msg += " Devin is waiting for your input."
                     await app.bot.send_message(
                         chat_id=chat_id,
                         text=status_msg,
-                        parse_mode="Markdown",
                     )
                 last_seen_status[session_id] = current_status
             except Exception as e:
